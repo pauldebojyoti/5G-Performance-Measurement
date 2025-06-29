@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>DASH Streaming - QoE Logs</title>
+    <script src="https://cdn.dashjs.org/latest/dash.all.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            text-align: center;
+            background: url('https://peach.blender.org/wp-content/uploads/title_anouncement.jpg?x11217') no-repeat center center fixed;
+            background-size: cover;
+            color: white;
+            padding: 20px;
+        }
+
+        h1 {
+            font-size: 32px;
+            text-shadow: 2px 2px 5px black;
+        }
+
+        video {
+            width: 100%;
+            max-width: 900px;
+            border: 4px solid white;
+            border-radius: 10px;
+            background-color: black;
+            box-shadow: 0px 0px 20px rgba(255, 255, 255, 0.7);
+        }
+
+        .metrics,
+        .controls {
+            margin-top: 20px;
+            display: flex;
+            justify-content: center;
+            gap: 15px;
+            flex-wrap: wrap;
+        }
+
+        .metric,
+        .control,
+        button {
+            background: rgba(0, 0, 0, 0.6);
+            padding: 10px 15px;
+            border-radius: 10px;
+            font-size: 16px;
+            border: 1px solid white;
+            color: white;
+            box-shadow: 2px 2px 10px rgba(255, 255, 255, 0.5);
+        }
+
+        button {
+            cursor: pointer;
+        }
+
+        #log {
+            margin-top: 20px;
+            max-height: 200px;
+            overflow-y: auto;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 10px;
+            border-radius: 5px;
+        }
+
+        .charts-container {
+            display: flex;
+            justify-content: center;
+            gap: 20px;
+            margin-top: 20px;
+            flex-wrap: wrap;
+        }
+
+        .chart-box {
+            width: 45%;
+            min-width: 300px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 15px;
+            border-radius: 10px;
+        }
+    </style>
+</head>
+
+<body>
+    <h1>DASH Streaming - QoE Logs</h1>
+    <video id="videoPlayer" controls></video>
+
+    <div class="controls">
+        <button onclick="downloadQoEData()">Download QoE CSV</button>
+    </div>
+
+    <div class="metrics">
+        <div class="metric"><strong>Bitrate:</strong> <span id="avgBitrate">0 MBPS</span></div>
+        <div class="metric"><strong>Stall Time:</strong> <span id="stallTime">0s</span></div>
+        <div class="metric"><strong>Quality Switches:</strong> <span id="qualitySwitches">0</span></div>
+        <div class="metric"><strong>Buffer Health:</strong> <span id="bufferHealth">0s</span></div>
+    </div>
+    <div id="log"></div>
+
+    <div class="charts-container">
+        <div class="chart-box"><canvas id="bitrateChart"></canvas></div>
+        <div class="chart-box"><canvas id="bufferChart"></canvas></div>
+        <div class="chart-box"><canvas id="qoeChart"></canvas></div>
+        <div class="chart-box"><canvas id="throughputChart"></canvas></div>
+    </div>
+
+    <script>
+        var url = "http://103.25.231.32/debo/bbb_master.mpd";
+        var player = dashjs.MediaPlayer().create();
+        var qualitySwitches = 0, totalStallTime = 0, stallStartTime = null;
+        var currentStallDuration = 0; // ← Track current stall duration
+        var videoElement = document.getElementById("videoPlayer");
+
+        player.initialize(videoElement, url, true);
+
+        function logEvent(msg) {
+            let logDiv = document.getElementById("log");
+            logDiv.innerHTML = `<div>${new Date().toLocaleTimeString()}: ${msg}</div>` + logDiv.innerHTML;
+        }
+
+        player.on(dashjs.MediaPlayer.events.BUFFER_EMPTY, function () {
+            if (!videoElement.paused && stallStartTime === null) {
+                stallStartTime = performance.now();
+            }
+        });
+
+        player.on(dashjs.MediaPlayer.events.BUFFER_LOADED, function () {
+            if (stallStartTime !== null) {
+                let stallDuration = (performance.now() - stallStartTime) / 1000;
+                totalStallTime += stallDuration;
+                currentStallDuration = stallDuration; // ← Track this segment's stall
+                document.getElementById("stallTime").textContent = totalStallTime.toFixed(1) + "s";
+                stallStartTime = null;
+            } else {
+                currentStallDuration = 0; // No stall
+            }
+        });
+
+        player.on(dashjs.MediaPlayer.events.QUALITY_CHANGE_RENDERED, function () {
+            qualitySwitches++;
+            document.getElementById("qualitySwitches").textContent = qualitySwitches;
+        });
+
+        const bitrateChart = new Chart(document.getElementById("bitrateChart"), {
+            type: "line",
+            data: { labels: [], datasets: [{ label: "Bitrate (MBPS)", data: [], borderColor: "cyan", fill: false, pointRadius: 0 }] },
+            options: { responsive: true }
+        });
+
+        const throughputChart = new Chart(document.getElementById("throughputChart"), {
+            type: "line",
+            data: { labels: [], datasets: [{ label: "Throughput (MBPS)", data: [], borderColor: "magenta", fill: false, pointRadius: 0 }] },
+            options: { responsive: true }
+        });
+
+        const bufferChart = new Chart(document.getElementById("bufferChart"), {
+            type: "line",
+            data: { labels: [], datasets: [{ label: "Buffer Health (s)", data: [], borderColor: "lime", fill: false, pointRadius: 0 }] },
+            options: { responsive: true }
+        });
+
+        const qoeChart = new Chart(document.getElementById("qoeChart"), {
+            type: "line",
+            data: { labels: [], datasets: [{ label: "QoE", data: [], borderColor: "orange", fill: false, pointRadius: 0 }] },
+            options: { responsive: true }
+        });
+
+        const p = 200; // max bitrate in MBps
+        const c = 1;
+        let segmentDownloadStart = {};
+
+        player.on(dashjs.MediaPlayer.events.FRAGMENT_LOADING_STARTED, function (e) {
+            if (e.request.mediaType === "video") {
+                segmentDownloadStart[e.request.index] = performance.now();
+            }
+        });
+
+        player.on(dashjs.MediaPlayer.events.FRAGMENT_LOADING_COMPLETED, function (e) {
+            if (e.request.mediaType !== "video") return;
+
+            const start = segmentDownloadStart[e.request.index];
+            if (!start) return;
+
+            const end = performance.now();
+            const durationSec = (end - start) / 1000;
+            const sizeBytes = e.request.bytesLoaded;
+            if (durationSec === 0) return;
+
+            // ✅ Convert correctly to MBPS
+            const instBitrateMBps = sizeBytes / (durationSec * 1_000_000);
+            const currentTime = videoElement.currentTime.toFixed(1);
+
+            // Plot throughput and bitrate
+            throughputChart.data.labels.push(currentTime);
+            throughputChart.data.datasets[0].data.push(instBitrateMBps);  // MBPS
+            throughputChart.update();
+
+            bitrateChart.data.labels.push(currentTime);
+            bitrateChart.data.datasets[0].data.push(instBitrateMBps);  // MBPS
+            bitrateChart.update();
+
+            // Buffer health
+            let bufferLength = player.getBufferLength();
+            document.getElementById("bufferHealth").textContent = bufferLength.toFixed(2) + "s";
+
+            bufferChart.data.labels.push(currentTime);
+            bufferChart.data.datasets[0].data.push(bufferLength);
+            bufferChart.update();
+
+            // QoE
+            const qoe = instBitrateMBps - (p * currentStallDuration) - (c * qualitySwitches);
+            qoeChart.data.labels.push(currentTime);
+            qoeChart.data.datasets[0].data.push(qoe);
+            qoeChart.update();
+
+            document.getElementById("avgBitrate").textContent = instBitrateMBps.toFixed(2) + " MBPS";
+
+            delete segmentDownloadStart[e.request.index];
+        });
+
+        function downloadQoEData() {
+            let csvContent = "data:text/csv;charset=utf-8,";
+            csvContent += "Time,Bitrate (MBPS),Stall Time (s),Quality Switches,Buffer Health (s),QoE\n";
+            let length = bitrateChart.data.labels.length;
+
+            for (let i = 0; i < length; i++) {
+                let time = bitrateChart.data.labels[i];
+                let bitrate = bitrateChart.data.datasets[0].data[i];  // ← This is now MBPS
+                let buffer = bufferChart.data.datasets[0].data[i] ?? "";
+                let qoe = qoeChart.data.datasets[0].data[i] ?? "";
+                csvContent += `${time},${bitrate},${currentStallDuration.toFixed(1)},${qualitySwitches},${buffer},${qoe}\n`;
+            }
+
+            const encodedUri = encodeURI(csvContent);
+            const link = document.createElement("a");
+            link.setAttribute("href", encodedUri);
+            link.setAttribute("download", "qoe_data.csv");
+            document.body.appendChild(link);
+            link.click();
+        }
+    </script>
+</body>
+
+</html>
